@@ -194,3 +194,26 @@ Follow the instructions to generate the certificate.
 ### 8. Access the relay
 
 Once everything is set up, the relay will be running on `localhost:3334` or your domain name if you set up nginx.
+
+## Upgrading (database format changed)
+
+sw2 now uses the consolidated [`fiatjaf.com/nostr`](https://pkg.go.dev/fiatjaf.com/nostr) library (the archived `khatru`/`eventstore`/`go-nostr` modules are gone). **An old database opens but serves nothing** — export it first, then replay into the new binary:
+
+```bash
+# with the relay stopped
+cd tools/export-legacy-db && go build -o export-legacy-db . && cd ../..
+./tools/export-legacy-db/export-legacy-db db > events.jsonl
+mv db db-old-backup     # start fresh
+./sw2 &                 # new binary creates a new-format db/
+cat events.jsonl | nak event ws://localhost:3334
+```
+
+Replayed events still pass the write whitelist. Two behaviour changes: kind-5 deletions now pass the whitelist and are stored; an empty read whitelist is now publicly readable without auth (as section 4.1 describes).
+
+## Tests
+
+```bash
+go test ./...                        # unit + integration (permission matrix)
+go build -o sw2 .
+go run ./e2e -binary ./sw2 -matrix   # also: -open, -legacy
+```
