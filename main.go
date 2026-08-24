@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/fiatjaf/eventstore/lmdb"
-	"github.com/fiatjaf/khatru"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore/lmdb"
+	"fiatjaf.com/nostr/khatru"
 	"github.com/joho/godotenv"
-	"github.com/nbd-wtf/go-nostr"
 )
 
 type WriteWhitelist struct {
@@ -71,11 +71,76 @@ func loadReadWhitelist(filename string) (*ReadWhitelist, error) {
 	return &readWhitelist, nil
 }
 
+// parsePubkeySet converts hex whitelist entries to typed pubkeys for the
+// comparisons the new library requires. Unparseable entries are skipped with
+// a warning — under the old string comparison they could never match either,
+// so behaviour is unchanged.
+func parsePubkeySet(pubkeys []string) map[nostr.PubKey]bool {
+	set := make(map[nostr.PubKey]bool, len(pubkeys))
+	for _, hex := range pubkeys {
+		pk, err := nostr.PubKeyFromHex(hex)
+		if err != nil {
+			fmt.Println("Warning: skipping invalid pubkey in whitelist:", hex)
+			continue
+		}
+		set[pk] = true
+	}
+	return set
+}
+
+// writePolicy preserves sw2's write rules exactly: an empty whitelist admits
+// every author; otherwise the event author must be listed. The empty check is
+// on the raw list (not the parsed set) so a list of only-invalid entries
+// still rejects everyone, as it always has.
+func writePolicy(rawCount int, allowed map[nostr.PubKey]bool) func(context.Context, nostr.Event) (bool, string) {
+	var zero nostr.PubKey
+	return func(ctx context.Context, event nostr.Event) (reject bool, msg string) {
+		if event.PubKey == zero {
+			return true, "no pubkey"
+		}
+
+		// Allow if writeWhitelist is empty
+		if rawCount == 0 {
+			return false, ""
+		}
+
+		if allowed[event.PubKey] {
+			return false, ""
+		}
+
+		return true, "pubkey not whitelisted"
+	}
+}
+
+// readPolicy: with an empty read whitelist the relay is publicly readable —
+// no authentication asked — matching the README's long-documented behaviour
+// ("if read_whitelist.json contains no pubkeys, all users are authorised to
+// read"). With a populated list, every query requires NIP-42 authentication
+// and the authenticated pubkey must be listed.
+func readPolicy(rawCount int, allowed map[nostr.PubKey]bool) func(context.Context, nostr.Filter) (bool, string) {
+	return func(ctx context.Context, filter nostr.Filter) (reject bool, msg string) {
+		// Allow if readWhitelist is empty
+		if rawCount == 0 {
+			return false, ""
+		}
+
+		authenticatedUser, authed := khatru.GetAuthed(ctx)
+		if !authed {
+			return true, "auth-required: this query requires you to be authenticated"
+		}
+
+		if allowed[authenticatedUser] {
+			return false, ""
+		}
+		return true, "restricted: you're not authorized to read"
+	}
+}
+
 func main() {
 	godotenv.Load(".env")
 
 	relay := khatru.NewRelay()
-	db := lmdb.LMDBBackend{
+	db := &lmdb.LMDBBackend{
 		Path: "db/",
 	}
 
@@ -84,12 +149,20 @@ func main() {
 	}
 
 	relay.Info.Name = os.Getenv("RELAY_NAME")
-	relay.Info.PubKey = os.Getenv("RELAY_PUBKEY")
 	relay.Info.Icon = os.Getenv("RELAY_ICON")
 	relay.Info.Contact = os.Getenv("RELAY_CONTACT")
 	relay.Info.Description = os.Getenv("RELAY_DESCRIPTION")
 	relay.Info.Software = "https://github.com/bitvora/sw2"
 	relay.Info.Version = "0.1.0"
+	if hex := os.Getenv("RELAY_PUBKEY"); hex != "" {
+		if pk, err := nostr.PubKeyFromHex(hex); err == nil {
+			relay.Info.PubKey = &pk
+		} else {
+			// the old NIP-11 document served any string here; don't refuse to
+			// start over a value that previously "worked"
+			fmt.Println("Warning: RELAY_PUBKEY is not valid hex, omitting from NIP-11:", hex)
+		}
+	}
 
 	writeWhitelist, err := loadWriteWhitelist()
 	if err != nil {
@@ -102,28 +175,11 @@ func main() {
 		fmt.Println(pubkey)
 	}
 
-	relay.RejectEvent = append(relay.RejectEvent, func(ctx context.Context, event *nostr.Event) (reject bool, msg string) {
-		if event.PubKey == "" {
-			return true, "no pubkey"
-		}
+	relay.OnEvent = writePolicy(len(writeWhitelist.Pubkeys), parsePubkeySet(writeWhitelist.Pubkeys))
 
-		// Allow if writeWhitelist is empty
-		if len(writeWhitelist.Pubkeys) == 0 {
-			return false, ""
-		}
-
-		for _, pubkey := range writeWhitelist.Pubkeys {
-			if pubkey == event.PubKey {
-				return false, ""
-			}
-		}
-
-		return true, "pubkey not whitelisted"
-	})
-
-	relay.OnConnect = append(relay.OnConnect, func(ctx context.Context) {
+	relay.OnConnect = func(ctx context.Context) {
 		khatru.RequestAuth(ctx)
-	})
+	}
 
 	readWhitelist, err := loadReadWhitelist("read_whitelist.json")
 	if err != nil {
@@ -136,30 +192,15 @@ func main() {
 		fmt.Println(pubkey)
 	}
 
-	relay.StoreEvent = append(relay.StoreEvent, db.SaveEvent)
-	relay.QueryEvents = append(relay.QueryEvents, db.QueryEvents)
+	// wires StoreEvent, QueryStored, ReplaceEvent, DeleteEvent and Count,
+	// replacing the individual hook assignments of the old khatru API. 1500
+	// matches the old lmdb backend's MaxLimit, so explicit client limits are
+	// capped exactly as before (no-limit queries previously defaulted to 375;
+	// they now get up to 1500).
+	relay.UseEventstore(db, 1500)
 
-	relay.RejectFilter = append(relay.RejectFilter, func(ctx context.Context, filter nostr.Filter) (reject bool, msg string) {
-		authenticatedUser := khatru.GetAuthed(ctx)
-		if authenticatedUser == "" {
-			return true, "auth-required: this query requires you to be authenticated"
-		}
+	relay.OnRequest = readPolicy(len(readWhitelist.Pubkeys), parsePubkeySet(readWhitelist.Pubkeys))
 
-		// Allow if readWhitelist is empty
-		if len(readWhitelist.Pubkeys) == 0 {
-			return false, ""
-		}
-
-		for _, pubkey := range readWhitelist.Pubkeys {
-			if pubkey == authenticatedUser {
-				return false, ""
-			}
-		}
-		return true, "restricted: you're not authorized to read"
-	})
-
-	relay.CountEvents = append(relay.CountEvents, db.CountEvents)
-	relay.DeleteEvent = append(relay.DeleteEvent, db.DeleteEvent)
 	fmt.Println("running on :3334")
 	http.ListenAndServe(":3334", relay)
 }

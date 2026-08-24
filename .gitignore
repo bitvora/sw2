@@ -3,3 +3,4 @@ db/
 sw2
 docker-compose.yml
 Dockerfile
+tools/export-legacy-db/export-legacy-db
