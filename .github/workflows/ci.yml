@@ -36,3 +36,6 @@ jobs:
 
       - name: e2e - legacy whitelist primacy
         run: go run ./e2e -binary ./sw2 -legacy
+
+      - name: e2e - env-var whitelists
+        run: go run ./e2e -binary ./sw2 -env

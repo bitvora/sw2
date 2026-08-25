@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore/lmdb"
@@ -18,7 +19,28 @@ type WriteWhitelist struct {
 	Pubkeys []string `json:"pubkeys"`
 }
 
+// pubkeysFromEnv reads a comma-separated pubkey list from the named env var.
+// A set-but-blank variable reports ok=false so the file path is used instead —
+// an accidentally empty variable must not turn an empty whitelist into
+// allow-everyone semantics.
+func pubkeysFromEnv(key string) (pubkeys []string, ok bool) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil, false
+	}
+	for _, entry := range strings.Split(raw, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			pubkeys = append(pubkeys, entry)
+		}
+	}
+	return pubkeys, len(pubkeys) > 0
+}
+
 func loadWriteWhitelist() (*WriteWhitelist, error) {
+	if pubkeys, ok := pubkeysFromEnv("WRITE_WHITELIST_PUBKEYS"); ok {
+		return &WriteWhitelist{Pubkeys: pubkeys}, nil
+	}
+
 	// Try opening "whitelist.json" first
 	file, err := os.Open("whitelist.json")
 	if err != nil {
@@ -52,6 +74,10 @@ type ReadWhitelist struct {
 }
 
 func loadReadWhitelist(filename string) (*ReadWhitelist, error) {
+	if pubkeys, ok := pubkeysFromEnv("READ_WHITELIST_PUBKEYS"); ok {
+		return &ReadWhitelist{Pubkeys: pubkeys}, nil
+	}
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("could not open file: %w", err)
