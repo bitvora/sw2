@@ -6,6 +6,7 @@
 //	go build -o sw2 . && go run ./e2e -binary ./sw2 -matrix
 //	go run ./e2e -binary ./sw2 -open     # empty lists: anyone writes, reads are public
 //	go run ./e2e -binary ./sw2 -legacy   # whitelist.json takes primacy over write_whitelist.json
+//	go run ./e2e -binary ./sw2 -env      # *_WHITELIST_PUBKEYS env vars override the files
 //
 // The relay listens on the fixed port 3334 (sw2 behaviour), so run one mode
 // at a time.
@@ -40,7 +41,10 @@ func check(name string, ok bool, detail string) {
 
 // startRelay runs the sw2 binary in a temp dir seeded with the given
 // whitelist files, waits for the port to accept, and returns a stop func.
-func startRelay(binary string, files map[string]string) func() {
+// The whitelist env vars are always scrubbed from the inherited environment
+// so ambient shell state cannot contaminate file-based modes; extraEnv
+// entries ("KEY=value") are appended after the scrub.
+func startRelay(binary string, files map[string]string, extraEnv ...string) func() {
 	dir, err := os.MkdirTemp("", "sw2-e2e-")
 	if err != nil {
 		panic(err)
@@ -56,6 +60,13 @@ func startRelay(binary string, files map[string]string) func() {
 	}
 	cmd := exec.Command(abs)
 	cmd.Dir = dir
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "WRITE_WHITELIST_PUBKEYS=") || strings.HasPrefix(kv, "READ_WHITELIST_PUBKEYS=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, kv)
+	}
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -237,15 +248,54 @@ func runLegacy(binary string) {
 		fmt.Sprintf("expected rejection, got %v", err))
 }
 
+// runEnv: WRITE/READ_WHITELIST_PUBKEYS take priority over the files, and a
+// blank variable falls back to the files rather than opening the relay.
+func runEnv(binary string) {
+	skEnv, skFile := nostr.Generate(), nostr.Generate()
+	files := map[string]string{
+		"write_whitelist.json": pubkeysJSON(skFile),
+		"read_whitelist.json":  pubkeysJSON(skFile),
+	}
+
+	stop := startRelay(binary, files,
+		"WRITE_WHITELIST_PUBKEYS="+nostr.GetPublicKey(skEnv).Hex(),
+		"READ_WHITELIST_PUBKEYS="+nostr.GetPublicKey(skEnv).Hex(),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	check("env: env-listed author can write", tryWrite(ctx, skEnv) == nil, "publish rejected")
+	err := tryWrite(ctx, skFile)
+	check("env: file-listed author is rejected (env takes priority)",
+		err != nil && strings.Contains(err.Error(), "not whitelisted"),
+		fmt.Sprintf("expected rejection, got %v", err))
+	allowed, reason := tryRead(ctx, &skEnv)
+	check("env: env-listed reader can read", allowed, "CLOSED "+reason)
+	allowed, reason = tryRead(ctx, &skFile)
+	check("env: file-listed reader is rejected (env takes priority)",
+		!allowed && strings.Contains(reason, "not authorized"),
+		fmt.Sprintf("expected restricted, got allowed=%v %q", allowed, reason))
+	stop()
+
+	stop = startRelay(binary, files, "WRITE_WHITELIST_PUBKEYS=   ", "READ_WHITELIST_PUBKEYS=")
+	defer stop()
+	check("blank env: file-listed author can write (fallback to files)", tryWrite(ctx, skFile) == nil, "publish rejected")
+	err = tryWrite(ctx, skEnv)
+	check("blank env: env key is not whitelisted",
+		err != nil && strings.Contains(err.Error(), "not whitelisted"),
+		fmt.Sprintf("expected rejection, got %v", err))
+}
+
 func main() {
 	binary := flag.String("binary", "./sw2", "path to the sw2 binary")
 	matrix := flag.Bool("matrix", false, "run the 4-key read/write permission matrix")
 	open := flag.Bool("open", false, "run the empty-whitelists checks")
 	legacy := flag.Bool("legacy", false, "run the legacy whitelist.json primacy check")
+	env := flag.Bool("env", false, "run the env-var whitelist priority checks")
 	flag.Parse()
 
-	if !*matrix && !*open && !*legacy {
-		fmt.Println("pick a mode: -matrix, -open, or -legacy")
+	if !*matrix && !*open && !*legacy && !*env {
+		fmt.Println("pick a mode: -matrix, -open, -legacy, or -env")
 		os.Exit(2)
 	}
 	if *matrix {
@@ -256,6 +306,9 @@ func main() {
 	}
 	if *legacy {
 		runLegacy(*binary)
+	}
+	if *env {
+		runEnv(*binary)
 	}
 	if failures > 0 {
 		fmt.Printf("\n%d failure(s)\n", failures)
